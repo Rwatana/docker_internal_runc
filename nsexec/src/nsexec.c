@@ -185,10 +185,12 @@ void nl_free(struct nlconfig_t *config) { free(config->data); }
 
 // nsenter.go call nsexec function for creating containers.
 void nsexec(void) {
-  int pipenum;
+  	int pipenum;
 	jmp_buf env;
 	int sync_child_pipe[2], sync_grandchild_pipe[2];
 	struct nlconfig_t config = { 0 };
+
+	setup_logpipe();
 
 	pipenum = getenv_int("_LIBCONTAINER_INITPIPE");
 	if (pipenum < 0) {
@@ -196,8 +198,14 @@ void nsexec(void) {
 		return;
 	}
 
+
+
 	if (write(pipenum, "", 1) != 1)
 		bail("could not inform the parent we are past initial setup");
+
+	
+	write_log(DEBUG, "=> nsexec container setup");
+
 
 	/* Parse all of the netlink configuration. */
 	nl_parse(pipenum, &config);
@@ -215,14 +223,18 @@ void nsexec(void) {
 
 	switch (setjmp(env)) {
 	case STAGE_PARENT:{
-
 			int len;
 			pid_t stage1_pid = -1, stage2_pid = -1;
 			bool stage1_complete, stage2_complete;
-			stage1_pid = clone_parent(&env, STAGE_CHILD);
 
+			/* For debugging. */
 			current_stage = STAGE_PARENT;
+			prctl(PR_SET_NAME, (unsigned long)"runc:[0:PARENT]", 0, 0, 0);
+			write_log(DEBUG, "~> nsexec stage-0");
 
+			/* Start the process of getting a container. */
+			write_log(DEBUG, "spawn stage-1");
+			stage1_pid = clone_parent(&env, STAGE_CHILD);
 			if (stage1_pid < 0)
 				bail("unable to spawn stage-1");
 
@@ -230,6 +242,11 @@ void nsexec(void) {
 			if (close(sync_child_pipe[0]) < 0)
 				bail("failed to close sync_child_pipe[0] fd");
 
+			/*
+			 * State machine for synchronisation with the children. We only
+			 * return once both the child and grandchild are ready.
+			 */
+			write_log(DEBUG, "-> stage-1 synchronisation loop");
 			stage1_complete = false;
 			while (!stage1_complete) {
 				enum sync_t s;
@@ -239,22 +256,46 @@ void nsexec(void) {
 
 				switch (s) {
 				case SYNC_USERMAP_PLS:
+					write_log(DEBUG, "stage-1 requested userns mappings");
+
+					/*
+					 * Enable setgroups(2) if we've been asked to. But we also
+					 * have to explicitly disable setgroups(2) if we're
+					 * creating a rootless container for single-entry mapping.
+					 * i.e. config.is_setgroup == false.
+					 * (this is required since Linux 3.19).
+					 *
+					 * For rootless multi-entry mapping, config.is_setgroup shall be true and
+					 * newuidmap/newgidmap shall be used.
+					 */
+					if (config.is_rootless_euid && !config.is_setgroup)
+						update_setgroups(stage1_pid, SETGROUPS_DENY);
+
+					/* Set up mappings. */
+					update_uidmap(config.uidmappath, stage1_pid, config.uidmap, config.uidmap_len);
+					update_gidmap(config.gidmappath, stage1_pid, config.gidmap, config.gidmap_len);
 
 					s = SYNC_USERMAP_ACK;
 					if (write(syncfd, &s, sizeof(s)) != sizeof(s)) {
+						sane_kill(stage1_pid, SIGKILL);
+						sane_kill(stage2_pid, SIGKILL);
 						bail("failed to sync with stage-1: write(SYNC_USERMAP_ACK)");
 					}
 					break;
 				case SYNC_RECVPID_PLS:
+					write_log(DEBUG, "stage-1 requested pid to be forwarded");
 
 					/* Get the stage-2 pid. */
 					if (read(syncfd, &stage2_pid, sizeof(stage2_pid)) != sizeof(stage2_pid)) {
+						sane_kill(stage1_pid, SIGKILL);
 						bail("failed to sync with stage-1: read(stage2_pid)");
 					}
 
 					/* Send ACK. */
 					s = SYNC_RECVPID_ACK;
 					if (write(syncfd, &s, sizeof(s)) != sizeof(s)) {
+						sane_kill(stage1_pid, SIGKILL);
+						sane_kill(stage2_pid, SIGKILL);
 						bail("failed to sync with stage-1: write(SYNC_RECVPID_ACK)");
 					}
 
@@ -265,38 +306,52 @@ void nsexec(void) {
 					 * cannot reap it within stage-0 and thus we need to ask
 					 * runc to reap the zombie for us.
 					 */
+					write_log(DEBUG, "forward stage-1 (%d) and stage-2 (%d) pids to runc",
+						  stage1_pid, stage2_pid);
 					len =
 					    dprintf(pipenum, "{\"stage1_pid\":%d,\"stage2_pid\":%d}\n", stage1_pid,
 						    stage2_pid);
 					if (len < 0) {
+						sane_kill(stage1_pid, SIGKILL);
+						sane_kill(stage2_pid, SIGKILL);
 						bail("failed to sync with runc: write(pid-JSON)");
 					}
 					break;
 				case SYNC_MOUNTSOURCES_PLS:
+					write_log(DEBUG, "stage-1 requested to open mount sources");
+					send_mountsources(syncfd, stage1_pid, config.mountsources,
+							  config.mountsources_len);
 
 					s = SYNC_MOUNTSOURCES_ACK;
 					if (write(syncfd, &s, sizeof(s)) != sizeof(s)) {
+						sane_kill(stage1_pid, SIGKILL);
 						bail("failed to sync with child: write(SYNC_MOUNTSOURCES_ACK)");
 					}
 					break;
 				case SYNC_CHILD_FINISH:
+					write_log(DEBUG, "stage-1 complete");
 					stage1_complete = true;
 					break;
 				default:
 					bail("unexpected sync value: %u", s);
 				}
 			}
+			write_log(DEBUG, "<- stage-1 synchronisation loop");
 
 			/* Now sync with grandchild. */
 			syncfd = sync_grandchild_pipe[1];
 			if (close(sync_grandchild_pipe[0]) < 0)
 				bail("failed to close sync_grandchild_pipe[0] fd");
+
+			write_log(DEBUG, "-> stage-2 synchronisation loop");
 			stage2_complete = false;
 			while (!stage2_complete) {
 				enum sync_t s;
 
+				write_log(DEBUG, "signalling stage-2 to run");
 				s = SYNC_GRANDCHILD;
 				if (write(syncfd, &s, sizeof(s)) != sizeof(s)) {
+					sane_kill(stage2_pid, SIGKILL);
 					bail("failed to sync with child: write(SYNC_GRANDCHILD)");
 				}
 
@@ -305,12 +360,15 @@ void nsexec(void) {
 
 				switch (s) {
 				case SYNC_CHILD_FINISH:
+					write_log(DEBUG, "stage-2 complete");
 					stage2_complete = true;
 					break;
 				default:
 					bail("unexpected sync value: %u", s);
 				}
 			}
+			write_log(DEBUG, "<- stage-2 synchronisation loop");
+			write_log(DEBUG, "<~ nsexec stage-0");
 			exit(0);
 		}
 		break;
@@ -324,6 +382,9 @@ void nsexec(void) {
 			syncfd = sync_child_pipe[0];
 			if (close(sync_child_pipe[1]) < 0)
 				bail("failed to close sync_child_pipe[1] fd");
+			
+			prctl(PR_SET_NAME, (unsigned long)"runc:[1:CHILD]", 0, 0, 0);
+			write_log(DEBUG, "~> nsexec stage-1");
 
 			if (config.cloneflags & CLONE_NEWUSER) {
 				s = SYNC_USERMAP_PLS;
@@ -336,10 +397,7 @@ void nsexec(void) {
 				if (s != SYNC_USERMAP_ACK)
 					bail("failed to sync with parent: SYNC_USERMAP_ACK: got %u", s);
 
-				if (read(syncfd, &s, sizeof(s)) != sizeof(s))
-					bail("failed to sync with parent: read(SYNC_MOUNTSOURCES_ACK)");
-				if (s != SYNC_MOUNTSOURCES_ACK)
-					bail("failed to sync with parent: SYNC_MOUNTSOURCES_ACK: got %u", s);
+				
 			}
 
 			stage2_pid = clone_parent(&env, STAGE_INIT);
@@ -349,19 +407,28 @@ void nsexec(void) {
 			/* Send the child to our parent, which knows what it's doing. */
 			s = SYNC_RECVPID_PLS;
 			if (write(syncfd, &s, sizeof(s)) != sizeof(s)) {
+				sane_kill(stage2_pid, SIGKILL);
 				bail("failed to sync with parent: write(SYNC_RECVPID_PLS)");
 			}
 			if (write(syncfd, &stage2_pid, sizeof(stage2_pid)) != sizeof(stage2_pid)) {
+				sane_kill(stage2_pid, SIGKILL);
 				bail("failed to sync with parent: write(stage2_pid)");
 			}
+			
+			write_log(DEBUG, "request stage-0 to map user namespace");
 
 			/* ... wait for parent to get the pid ... */
 			if (read(syncfd, &s, sizeof(s)) != sizeof(s)) {
+				sane_kill(stage2_pid, SIGKILL);
 				bail("failed to sync with parent: read(SYNC_RECVPID_ACK)");
 			}
 			if (s != SYNC_RECVPID_ACK) {
+				sane_kill(stage2_pid, SIGKILL);
 				bail("failed to sync with parent: SYNC_RECVPID_ACK: got %u", s);
+				
 			}
+
+			write_log(DEBUG, "signal completion to stage-0");
 
 			s = SYNC_CHILD_FINISH;
 			if (write(syncfd, &s, sizeof(s)) != sizeof(s)) {
@@ -369,6 +436,7 @@ void nsexec(void) {
 				bail("failed to sync with parent: write(SYNC_CHILD_FINISH)");
 			}
 			/* Our work is done. [Stage 2: STAGE_INIT] is doing the rest of the work. */
+			write_log(DEBUG, "<~ nsexec stage-1");
 			exit(0);
 		}
 		break;
