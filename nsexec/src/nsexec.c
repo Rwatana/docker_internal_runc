@@ -190,7 +190,7 @@ void nsexec(void) {
 	int sync_child_pipe[2], sync_grandchild_pipe[2];
 	struct nlconfig_t config = { 0 };
 
-	setup_logpipe();
+	// setup_logpipe();
 
 	pipenum = getenv_int("_LIBCONTAINER_INITPIPE");
 	if (pipenum < 0) {
@@ -204,11 +204,11 @@ void nsexec(void) {
 		bail("could not inform the parent we are past initial setup");
 
 	
-	write_log(DEBUG, "=> nsexec container setup");
+	// write_log(DEBUG, "=> nsexec container setup");
 
 
 	/* Parse all of the netlink configuration. */
-	nl_parse(pipenum, &config);
+	// nl_parse(pipenum, &config);
 
 	/* Pipe so we can tell the child when we've finished setting up. */
 	if (socketpair(AF_LOCAL, SOCK_STREAM, 0, sync_child_pipe) < 0)
@@ -220,7 +220,8 @@ void nsexec(void) {
 	 */
 	if (socketpair(AF_LOCAL, SOCK_STREAM, 0, sync_grandchild_pipe) < 0)
 		bail("failed to setup sync pipe between parent and grandchild");
-
+	
+	exit(0);
 	switch (setjmp(env)) {
 	case STAGE_PARENT:{
 			int len;
@@ -229,7 +230,7 @@ void nsexec(void) {
 
 			/* For debugging. */
 			current_stage = STAGE_PARENT;
-			prctl(PR_SET_NAME, (unsigned long)"runc:[0:PARENT]", 0, 0, 0);
+			// prctl(PR_SET_NAME, (unsigned long)"runc:[0:PARENT]", 0, 0, 0);
 			write_log(DEBUG, "~> nsexec stage-0");
 
 			/* Start the process of getting a container. */
@@ -268,12 +269,12 @@ void nsexec(void) {
 					 * For rootless multi-entry mapping, config.is_setgroup shall be true and
 					 * newuidmap/newgidmap shall be used.
 					 */
-					if (config.is_rootless_euid && !config.is_setgroup)
-						update_setgroups(stage1_pid, SETGROUPS_DENY);
+					// if (config.is_rootless_euid && !config.is_setgroup)
+					// 	update_setgroups(stage1_pid, SETGROUPS_DENY);
 
 					/* Set up mappings. */
-					update_uidmap(config.uidmappath, stage1_pid, config.uidmap, config.uidmap_len);
-					update_gidmap(config.gidmappath, stage1_pid, config.gidmap, config.gidmap_len);
+					// update_uidmap(config.uidmappath, stage1_pid, config.uidmap, config.uidmap_len);
+					// update_gidmap(config.gidmappath, stage1_pid, config.gidmap, config.gidmap_len);
 
 					s = SYNC_USERMAP_ACK;
 					if (write(syncfd, &s, sizeof(s)) != sizeof(s)) {
@@ -319,8 +320,8 @@ void nsexec(void) {
 					break;
 				case SYNC_MOUNTSOURCES_PLS:
 					write_log(DEBUG, "stage-1 requested to open mount sources");
-					send_mountsources(syncfd, stage1_pid, config.mountsources,
-							  config.mountsources_len);
+					// send_mountsources(syncfd, stage1_pid, config.mountsources,
+					// 		  config.mountsources_len);
 
 					s = SYNC_MOUNTSOURCES_ACK;
 					if (write(syncfd, &s, sizeof(s)) != sizeof(s)) {
@@ -383,7 +384,7 @@ void nsexec(void) {
 			if (close(sync_child_pipe[1]) < 0)
 				bail("failed to close sync_child_pipe[1] fd");
 			
-			prctl(PR_SET_NAME, (unsigned long)"runc:[1:CHILD]", 0, 0, 0);
+			// prctl(PR_SET_NAME, (unsigned long)"runc:[1:CHILD]", 0, 0, 0);
 			write_log(DEBUG, "~> nsexec stage-1");
 
 			if (config.cloneflags & CLONE_NEWUSER) {
@@ -493,4 +494,9 @@ void nsexec(void) {
 	default:
 		bail("unexpected jump value");
 	}
+}
+
+int main (int argc, char* argv[]) {
+	nsexec();
+
 }

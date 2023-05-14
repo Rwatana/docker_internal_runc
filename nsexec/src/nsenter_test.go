@@ -31,8 +31,10 @@ func TestNsenterBasic(t *testing.T) {
 
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("nsenter failed to start: %v", err)
+
 	}
 	child.Close()
+	t.Error("child is finished")
 
 	// Format new net link request corresponding to the message
 	r := nl.NewNetlinkRequest(int(libcontainer.InitMsg), 0)
